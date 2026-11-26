@@ -110,6 +110,12 @@ type flow struct {
 type Analyser struct {
 	synced bool
 	buffer []byte
+	// head is where the unaccounted bytes start in buffer. Accounted bytes
+	// are dropped by moving head, and what is left is copied down in one go
+	// when more is fed in (see Feed), never by a copy per packet: copying in
+	// advance, once per packet, made feeding a chunk of N packets move the
+	// buffer's contents N times, which a slow host cannot pay for.
+	head int
 	// sequences is the last MMTP packet_sequence_number seen in each run.
 	sequences map[run]uint32
 	stats     Stats
@@ -132,6 +138,11 @@ func (a *Analyser) Stats() Stats { return a.stats }
 // Feed accounts for the next bytes of the stream, in any sizes.
 func (a *Analyser) Feed(data []byte) {
 	a.stats.Bytes += uint64(len(data))
+	if a.head > 0 {
+		// Drop what earlier feeds accounted for, in one copy.
+		a.buffer = append(a.buffer[:0], a.buffer[a.head:]...)
+		a.head = 0
+	}
 	a.buffer = append(a.buffer, data...)
 	for {
 		if !a.synced {
@@ -163,8 +174,8 @@ func validType(value byte) bool {
 // let one bad byte hold up a stream that lines up four bytes further on.
 func (a *Analyser) hunt() bool {
 	undecided := -1
-	for offset := 0; offset < len(a.buffer); offset++ {
-		lined, judged := a.chain(offset)
+	for offset := 0; offset < len(a.buffer)-a.head; offset++ {
+		lined, judged := a.chain(a.head + offset)
 		if lined {
 			a.discard(offset)
 			a.synced = true
@@ -175,7 +186,7 @@ func (a *Analyser) hunt() bool {
 		}
 	}
 	if undecided < 0 {
-		a.discard(len(a.buffer))
+		a.discard(len(a.buffer) - a.head)
 		return false
 	}
 	a.discard(undecided)
@@ -205,10 +216,10 @@ func (a *Analyser) chain(offset int) (lined, judged bool) {
 // reports whether the caller has to go back to hunting.
 func (a *Analyser) consume() bool {
 	for {
-		if len(a.buffer) < headerSize {
+		if len(a.buffer)-a.head < headerSize {
 			return false
 		}
-		if a.buffer[0] != SyncByte || !validType(a.buffer[1]) {
+		if a.buffer[a.head] != SyncByte || !validType(a.buffer[a.head+1]) {
 			// One byte goes so that the search starts somewhere new, and the
 			// sequence numbers go with it: what follows a break does not
 			// follow what came before it.
@@ -218,11 +229,11 @@ func (a *Analyser) consume() bool {
 			a.discard(1)
 			return true
 		}
-		length := int(binary.BigEndian.Uint16(a.buffer[2:4]))
-		if headerSize+length > len(a.buffer) {
+		length := int(binary.BigEndian.Uint16(a.buffer[a.head+2 : a.head+4]))
+		if headerSize+length > len(a.buffer)-a.head {
 			return false
 		}
-		a.packet(a.buffer[1], a.buffer[headerSize:headerSize+length])
+		a.packet(a.buffer[a.head+1], a.buffer[a.head+headerSize:a.head+headerSize+length])
 		a.advance(headerSize + length)
 	}
 }
@@ -236,11 +247,25 @@ func (a *Analyser) discard(count int) {
 	a.advance(count)
 }
 
+// advance drops bytes off the front that have already been accounted for.
+// Only head moves, so accounting for a packet costs no copy at all. When the
+// accounted front has grown to at least half of what is held, what is left
+// is copied down in one go; each byte is copied a constant number of times
+// per feed that way, and the buffer's length stays the amount still to
+// account for, give or take a packet.
 func (a *Analyser) advance(count int) {
 	if count <= 0 {
 		return
 	}
-	a.buffer = append(a.buffer[:0], a.buffer[count:]...)
+	a.head += count
+	switch {
+	case a.head == len(a.buffer):
+		a.buffer = a.buffer[:0]
+		a.head = 0
+	case 2*a.head >= len(a.buffer):
+		a.buffer = append(a.buffer[:0], a.buffer[a.head:]...)
+		a.head = 0
+	}
 }
 
 func (a *Analyser) packet(kind byte, payload []byte) {

@@ -82,6 +82,12 @@ type Analyser struct {
 	// buffer holds what has not been accounted for yet: a partial packet when
 	// synced, and whatever is still being searched when not.
 	buffer []byte
+	// head is where the unaccounted bytes start in buffer. Accounted bytes
+	// are dropped by moving head, and what is left is copied down in one go
+	// when more is fed in (see Feed), never by a copy per packet: copying in
+	// advance, once per packet, made feeding a chunk of N packets move the
+	// buffer's contents N times, which a slow host cannot pay for.
+	head int
 	// counters is the last continuity counter seen on each PID.
 	counters [NullPID + 1]int8
 	stats    Stats
@@ -115,6 +121,11 @@ func (a *Analyser) Stats() Stats { return a.stats }
 // because on none of these backends is it.
 func (a *Analyser) Feed(data []byte) {
 	a.stats.Bytes += uint64(len(data))
+	if a.head > 0 {
+		// Drop what earlier feeds accounted for, in one copy.
+		a.buffer = append(a.buffer[:0], a.buffer[a.head:]...)
+		a.head = 0
+	}
 	a.buffer = append(a.buffer, data...)
 	for {
 		if !a.synced {
@@ -132,8 +143,8 @@ func (a *Analyser) Feed(data []byte) {
 // sync bytes exactly one packet apart after it. Everything before it was not
 // part of a packet and is counted as skipped.
 func (a *Analyser) hunt() bool {
-	for offset := 0; offset+syncSpan <= len(a.buffer); offset++ {
-		if a.aligned(offset) {
+	for offset := 0; offset+syncSpan <= len(a.buffer)-a.head; offset++ {
+		if a.aligned(a.head + offset) {
 			a.discard(offset)
 			a.synced = true
 			return true
@@ -142,8 +153,8 @@ func (a *Analyser) hunt() bool {
 	// Nothing lined up. Everything except the tail that has not been fully
 	// tested yet can go: an offset needs a whole span after it to be judged,
 	// so an offset without one has not been ruled out.
-	if len(a.buffer) > huntLimit {
-		a.discard(len(a.buffer) - huntLimit)
+	if len(a.buffer)-a.head > huntLimit {
+		a.discard(len(a.buffer) - a.head - huntLimit)
 	}
 	return false
 }
@@ -174,19 +185,32 @@ func (a *Analyser) discard(count int) {
 }
 
 // advance drops bytes off the front that have already been accounted for.
+// Only head moves, so accounting for a packet costs no copy at all. When the
+// accounted front has grown to at least half of what is held, what is left
+// is copied down in one go; each byte is copied a constant number of times
+// per feed that way, and the buffer's length stays the amount still to
+// account for, give or take a packet.
 func (a *Analyser) advance(count int) {
 	if count <= 0 {
 		return
 	}
-	a.buffer = append(a.buffer[:0], a.buffer[count:]...)
+	a.head += count
+	switch {
+	case a.head == len(a.buffer):
+		a.buffer = a.buffer[:0]
+		a.head = 0
+	case 2*a.head >= len(a.buffer):
+		a.buffer = append(a.buffer[:0], a.buffer[a.head:]...)
+		a.head = 0
+	}
 }
 
 // consume takes whole packets off the front while the stream still lines up. It
 // returns false when it runs out of bytes and true when it lost sync, since the
 // caller then has to hunt again and there may be good packets after the break.
 func (a *Analyser) consume() bool {
-	for len(a.buffer) >= PacketSize {
-		if a.buffer[0] != SyncByte {
+	for len(a.buffer)-a.head >= PacketSize {
+		if a.buffer[a.head] != SyncByte {
 			// One byte goes, so the search starts somewhere new rather than
 			// testing this offset for ever, and the continuity counters go
 			// with it: what follows a break does not follow what came before.
@@ -196,7 +220,7 @@ func (a *Analyser) consume() bool {
 			a.discard(1)
 			return true
 		}
-		a.packet(a.buffer[:PacketSize])
+		a.packet(a.buffer[a.head : a.head+PacketSize])
 		a.advance(PacketSize)
 	}
 	return false
