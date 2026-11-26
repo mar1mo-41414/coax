@@ -27,13 +27,12 @@ import (
 	"github.com/Till0196/coax/pkg/usbio/backend"
 )
 
-// The ioctl direction bits and the encoding _IOC builds a request number from.
+// The field widths and shifts of the encoding _IOC builds a request number
+// from. The direction values and the size width are the kernel's ABI and
+// differ on MIPS; they live in ioc_linux_generic.go and ioc_mips_linux.go.
 const (
-	iocWrite     = 1
-	iocRead      = 2
 	iocNRBits    = 8
 	iocTypeBits  = 8
-	iocSizeBits  = 14
 	iocNRShift   = 0
 	iocTypeShift = iocNRShift + iocNRBits
 	iocSizeShift = iocTypeShift + iocTypeBits
@@ -53,7 +52,7 @@ var (
 	usbfsSetInterface     = ioc(iocRead, 'U', 4, unsafe.Sizeof(setInterface{}))
 	usbfsSetConfiguration = ioc(iocRead, 'U', 5, unsafe.Sizeof(uint32(0)))
 	usbfsSubmitURB        = ioc(iocRead, 'U', 10, unsafe.Sizeof(urb{}))
-	usbfsDiscardURB       = ioc(0, 'U', 11, 0)
+	usbfsDiscardURB       = ioc(iocNone, 'U', 11, 0)
 	usbfsReapURBNonBlock  = ioc(iocWrite, 'U', 13, unsafe.Sizeof(uintptr(0)))
 	usbfsClaimInterface   = ioc(iocRead, 'U', 15, unsafe.Sizeof(uint32(0)))
 	usbfsReleaseInterface = ioc(iocRead, 'U', 16, unsafe.Sizeof(uint32(0)))
